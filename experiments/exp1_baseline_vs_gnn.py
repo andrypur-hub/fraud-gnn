@@ -28,10 +28,9 @@ print("\n=== Loading Elliptic Dataset ===")
 X, y, edge_index, timestep = load_elliptic(DATA_DIR)
 
 # pakai hanya label known dulu
-mask_known = y != -1
-X = X[mask_known]
-y = y[mask_known]
-timestep = timestep[mask_known]
+from data.filter_graph import filter_graph_known_nodes
+
+X, y, edge_index, timestep = filter_graph_known_nodes(X, y, edge_index, timestep)
 
 print("\nAfter removing unknown:")
 print("Nodes:", len(y))
