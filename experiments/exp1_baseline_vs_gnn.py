@@ -1,48 +1,48 @@
 import os
 import numpy as np
-import pandas as pd
 import torch
 from torch_geometric.data import Data
 
-# project modules
+from sklearn.metrics import average_precision_score
+from xgboost import XGBClassifier
+
 from data.load_elliptic import load_elliptic
-from baselines.train_xgb import train_xgb
+from data.filter_graph import filter_graph_known_nodes
+from data.split_time import time_based_split
 from models.gnn.graphsage import GraphSAGE
 from trainers.train_gnn import train_gnn
-from evaluation.metrics import auc_pr, recall_at_k
+from evaluation.metrics import recall_at_k
 
 
 # =========================================================
-# CONFIG
-# =========================================================
-DATA_DIR = "/content/drive/MyDrive/ProjectPython/TGNN/Dataset/elliptic_bitcoin_dataset"   # <-- ganti jika beda
-RESULT_PATH = "results/exp1.csv"
-
-os.makedirs("results", exist_ok=True)
-
-
-# =========================================================
-# LOAD DATASET
+# 1. LOAD DATASET
 # =========================================================
 print("\n=== Loading Elliptic Dataset ===")
-X, y, edge_index, timestep = load_elliptic(DATA_DIR)
 
-# pakai hanya label known dulu
-from data.filter_graph import filter_graph_known_nodes
+dataset_path = "/content/drive/MyDrive/ProjectPython/TGNN/Dataset/elliptic_bitcoin_dataset"
 
+X, y, edge_index, timestep = load_elliptic(dataset_path)
+
+print("Nodes:", len(X))
+print("Features:", X.shape[1])
+print("Edges:", edge_index.shape[1])
+print("Fraud:", np.sum(y==1), "Normal:", np.sum(y==0), "Unknown:", np.sum(y==-1))
+
+
+# =========================================================
+# 2. REMOVE UNKNOWN + REINDEX GRAPH  ⭐ PENTING
+# =========================================================
 X, y, edge_index, timestep = filter_graph_known_nodes(X, y, edge_index, timestep)
 
 print("\nAfter removing unknown:")
-print("Nodes:", len(y))
-print("Fraud:", (y==1).sum(), "Normal:", (y==0).sum())
+print("Nodes:", len(X))
+print("Fraud:", np.sum(y==1), "Normal:", np.sum(y==0))
 
 
 # =========================================================
-# TIME SPLIT (REALISTIC)
+# 3. TIME SPLIT
 # =========================================================
-train_mask = timestep <= 34
-val_mask   = (timestep > 34) & (timestep <= 40)
-test_mask  = timestep > 40
+train_mask, val_mask, test_mask = time_based_split(timestep)
 
 print("\nSplit:")
 print("Train:", train_mask.sum())
@@ -51,62 +51,79 @@ print("Test:", test_mask.sum())
 
 
 # =========================================================
-# BASELINE — XGBOOST
+# 4. BASELINE (XGBOOST)
 # =========================================================
 print("\n=== Training XGBoost Baseline ===")
-model_xgb = train_xgb(X[train_mask], y[train_mask])
 
-prob_xgb = model_xgb.predict_proba(X[test_mask])[:,1]
+model_xgb = XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    tree_method="hist",
+    eval_metric="logloss"
+)
 
-auc_xgb = auc_pr(y[test_mask], prob_xgb)
-rec_xgb = recall_at_k(y[test_mask], prob_xgb)
+model_xgb.fit(X[train_mask], y[train_mask])
 
-print("XGBoost AUC-PR:", auc_xgb)
-print("XGBoost Recall@5%:", rec_xgb)
+probs = model_xgb.predict_proba(X[test_mask])[:,1]
+
+auc_pr = average_precision_score(y[test_mask], probs)
+rec5 = recall_at_k(y[test_mask], probs, k=0.05)
+
+print("XGBoost AUC-PR:", auc_pr)
+print("XGBoost Recall@5%:", rec5)
 
 
 # =========================================================
-# GRAPH MODEL — GraphSAGE
+# 5. BUILD GRAPH FOR GNN  ⭐ FIX EDGE INDEX DISINI
+# =========================================================
+print("\n=== Preparing Graph ===")
+
+x_torch = torch.tensor(X, dtype=torch.float)
+y_torch = torch.tensor(y, dtype=torch.long)
+edge_index_torch = torch.tensor(edge_index, dtype=torch.long)
+
+print("FINAL GRAPH CHECK")
+print("Nodes:", x_torch.shape[0])
+print("Max edge index:", edge_index_torch.max().item())
+
+data = Data(x=x_torch, edge_index=edge_index_torch, y=y_torch)
+
+
+train_mask_torch = torch.tensor(train_mask)
+val_mask_torch = torch.tensor(val_mask)
+test_mask_torch = torch.tensor(test_mask)
+
+
+# =========================================================
+# 6. TRAIN GRAPHSAGE
 # =========================================================
 print("\n=== Training GraphSAGE ===")
 
-data = Data(
-    x=torch.tensor(X, dtype=torch.float),
-    edge_index=torch.tensor(edge_index, dtype=torch.long),
-    y=torch.tensor(y, dtype=torch.float)
+model = GraphSAGE(
+    in_channels=X.shape[1],
+    hidden_channels=128,
+    out_channels=2
 )
 
-train_mask_torch = torch.tensor(train_mask)
-
-model = GraphSAGE(in_dim=X.shape[1])
 model = train_gnn(model, data, train_mask_torch, epochs=50)
 
-# inference
+
+# =========================================================
+# 7. EVALUATION
+# =========================================================
+print("\n=== Evaluating GNN ===")
+
 model.eval()
 with torch.no_grad():
-    logits = model(data)
-    prob = torch.sigmoid(logits).cpu().numpy()
+    out = model(data)
+    prob = torch.softmax(out, dim=1)[:,1].cpu().numpy()
 
-prob_test = prob[test_mask]
-
-auc_gnn = auc_pr(y[test_mask], prob_test)
-rec_gnn = recall_at_k(y[test_mask], prob_test)
-
-print("GraphSAGE AUC-PR:", auc_gnn)
-print("GraphSAGE Recall@5%:", rec_gnn)
-
-
-# =========================================================
-# SAVE RESULT
-# =========================================================
-df = pd.DataFrame({
-    "model":["XGBoost","GraphSAGE"],
-    "AUC_PR":[auc_xgb, auc_gnn],
-    "Recall@5%":[rec_xgb, rec_gnn]
-})
-
-df.to_csv(RESULT_PATH, index=False)
+auc_pr_gnn = average_precision_score(y[test_mask], prob[test_mask])
+rec5_gnn = recall_at_k(y[test_mask], prob[test_mask], k=0.05)
 
 print("\n=== FINAL RESULT ===")
-print(df)
-print("\nSaved to:", RESULT_PATH)
+print("XGBoost Recall@5% :", rec5)
+print("GraphSAGE Recall@5% :", rec5_gnn)
